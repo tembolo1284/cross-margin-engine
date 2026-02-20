@@ -1,0 +1,12 @@
+{"sequence":1,"event_type":{"type":"Deposit","account_id":"alice","amount":"100000"}}
+{"sequence":2,"event_type":{"type":"MarkPriceUpdate","market_id":"BTC-PERP","price":"50000"}}
+{"sequence":3,"event_type":{"type":"TradeFill","account_id":"alice","market_id":"BTC-PERP","quantity":"10","price":"50000"}}
+{"sequence":4,"event_type":{"type":"MarkPriceUpdate","market_id":"BTC-PERP","price":"42000"}}
+{"sequence":5,"event_type":{"type":"MarkPriceUpdate","market_id":"BTC-PERP","price":"41000"}}
+{"sequence":6,"event_type":{"type":"LiquidationFill","account_id":"alice","market_id":"BTC-PERP","quantity":"-10","price":"41000"}}
+{"sequence":7,"event_type":{"type":"Deposit","account_id":"bob","amount":"10000"}}
+{"sequence":8,"event_type":{"type":"MarkPriceUpdate","market_id":"ETH-PERP","price":"3000"}}
+{"sequence":9,"event_type":{"type":"TradeFill","account_id":"bob","market_id":"ETH-PERP","quantity":"20","price":"3000"}}
+{"sequence":10,"event_type":{"type":"TradeFill","account_id":"bob","market_id":"ETH-PERP","quantity":"20","price":"3000"}}
+{"sequence":11,"event_type":{"type":"TradeRejected","account_id":"bob","market_id":"ETH-PERP","quantity":"20","price":"3000","reason":"Insufficient margin: equity 10000 < IM required 12000.00"}}
+{"sequence":12,"event_type":{"type":"FundingUpdate","market_id":"ETH-PERP","new_cumulative_index":"1.50"}}
