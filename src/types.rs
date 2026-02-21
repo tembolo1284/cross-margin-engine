@@ -18,6 +18,11 @@ pub struct Account {
     pub collateral: Decimal,
     pub positions: BTreeMap<MarketId, Position>,
     pub last_funding: BTreeMap<MarketId, Decimal>,
+
+    /// If all positions are closed and collateral is negative, this records the
+    /// bankruptcy deficit as a non-negative number (auditable + replay-stable).
+    /// Otherwise this is zero.
+    pub bankruptcy_deficit: Decimal,
 }
 
 impl Account {
@@ -27,6 +32,7 @@ impl Account {
             collateral: Decimal::ZERO,
             positions: BTreeMap::new(),
             last_funding: BTreeMap::new(),
+            bankruptcy_deficit: Decimal::ZERO,
         }
     }
 }

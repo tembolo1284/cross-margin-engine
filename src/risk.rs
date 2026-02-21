@@ -1,10 +1,10 @@
+use rust_decimal::prelude::Signed;
 use rust_decimal::Decimal;
 use std::collections::BTreeMap;
 
 use crate::margin;
 use crate::state::State;
 use crate::types::{AccountId, MarketId, Position};
-use rust_decimal::prelude::Signed;
 
 /// Result of a pre-trade risk check.
 pub enum TradeCheck {
@@ -18,8 +18,9 @@ fn is_risk_reducing(current_qty: Decimal, fill_qty: Decimal) -> bool {
         return false;
     }
     let new_qty = current_qty + fill_qty;
-    // Reducing: same sign as before, but smaller absolute size
-    // Also allow closing exactly to zero
+
+    // Reducing: same sign as before, but smaller absolute size (or closes exactly to zero).
+    // Flips are NOT considered risk-reducing for the "always allow" rule.
     new_qty.is_zero()
         || (new_qty.signum() == current_qty.signum() && new_qty.abs() < current_qty.abs())
 }
@@ -40,6 +41,11 @@ pub fn check_trade(
         }
     };
 
+    // Market must exist (configured out-of-band)
+    if !state.markets.contains_key(market_id) {
+        return TradeCheck::Rejected(format!("Unknown market_id: {market_id}"));
+    }
+
     let current_qty = account
         .positions
         .get(market_id)
@@ -55,25 +61,24 @@ pub fn check_trade(
     let (sim_collateral, sim_positions) =
         simulate_trade(account, market_id, fill_quantity, fill_price);
 
-    // Compute simulated equity and IM
-    let sim_unrealized: Decimal = sim_positions
-        .iter()
-        .map(|(mid, pos)| {
-            let mark = state.markets[mid].mark_price;
-            margin::position_unrealized_pnl(pos.quantity, pos.cost_basis, mark)
-        })
-        .sum();
+    // Compute simulated equity and IM over the FULL portfolio (cross-margin)
+    let mut sim_unrealized = Decimal::ZERO;
+    let mut sim_im = Decimal::ZERO;
+
+    for (mid, pos) in sim_positions.iter() {
+        let market = match state.markets.get(mid) {
+            Some(m) => m,
+            None => {
+                // Deterministic rejection instead of panicking
+                return TradeCheck::Rejected(format!("Unknown market in portfolio: {mid}"));
+            }
+        };
+
+        sim_unrealized += margin::position_unrealized_pnl(pos.quantity, pos.cost_basis, market.mark_price);
+        sim_im += margin::position_notional(pos.quantity, market.mark_price) * market.initial_margin_fraction;
+    }
 
     let sim_equity = sim_collateral + sim_unrealized;
-
-    let sim_im: Decimal = sim_positions
-        .iter()
-        .map(|(mid, pos)| {
-            let market = &state.markets[mid];
-            margin::position_notional(pos.quantity, market.mark_price)
-                * market.initial_margin_fraction
-        })
-        .sum();
 
     if sim_equity >= sim_im {
         TradeCheck::Accepted
@@ -98,12 +103,13 @@ pub fn check_withdrawal(state: &State, account_id: &AccountId, amount: Decimal) 
     let eq = margin::equity(account, state);
     let im = margin::initial_margin_required(account, state);
 
-    if eq - amount >= im {
+    let eq_after = eq - amount;
+
+    if eq_after >= im {
         TradeCheck::Accepted
     } else {
         TradeCheck::Rejected(format!(
-            "Withdrawal would violate IM: equity after {eq_after} < IM {im}",
-            eq_after = eq - amount
+            "Withdrawal would violate IM: equity after {eq_after} < IM {im}"
         ))
     }
 }
@@ -115,7 +121,7 @@ fn simulate_trade(
     market_id: &MarketId,
     fill_quantity: Decimal,
     fill_price: Decimal,
-) -> (Decimal, std::collections::BTreeMap<MarketId, Position>) {
+) -> (Decimal, BTreeMap<MarketId, Position>) {
     let mut sim_collateral = account.collateral;
     let mut sim_positions = account.positions.clone();
 
@@ -138,14 +144,11 @@ pub fn apply_trade_to(
     fill_quantity: Decimal,
     fill_price: Decimal,
 ) {
-    let current_qty = positions
-        .get(market_id)
-        .map(|p| p.quantity)
-        .unwrap_or(Decimal::ZERO);
-    let current_cost = positions
-        .get(market_id)
-        .map(|p| p.cost_basis)
-        .unwrap_or(Decimal::ZERO);
+    // Pull current position once (avoid double map lookups).
+    let (current_qty, current_cost) = match positions.get(market_id) {
+        Some(p) => (p.quantity, p.cost_basis),
+        None => (Decimal::ZERO, Decimal::ZERO),
+    };
 
     let new_qty = current_qty + fill_quantity;
 
@@ -157,7 +160,10 @@ pub fn apply_trade_to(
         let realized_pnl = (fill_price * current_qty) - current_cost;
         *collateral += realized_pnl;
         positions.remove(market_id);
-    } else if current_qty.is_zero() {
+        return;
+    }
+
+    if current_qty.is_zero() {
         // Fresh open — no PnL, just record the position
         positions.insert(
             market_id.clone(),
@@ -167,35 +173,66 @@ pub fn apply_trade_to(
                 cost_basis: fill_quantity * fill_price,
             },
         );
-    } else if current_qty.signum() == fill_quantity.signum() {
-        // Increasing position — add to quantity and cost basis
-        let pos = positions.get_mut(market_id).unwrap();
+        return;
+    }
+
+    // If fill is same direction as current position => increase
+    if current_qty.signum() == fill_quantity.signum() {
+        let pos = positions.get_mut(market_id).expect("position must exist");
         pos.quantity = new_qty;
         pos.cost_basis += fill_quantity * fill_price;
-    } else if new_qty.signum() == current_qty.signum() {
-        // Partial close — realize PnL on the closed portion
-        // close_ratio is negative (e.g., closing 3 of long 10: -3/10 = -0.3)
-        let close_ratio = fill_quantity / current_qty;
-        // Cost of closed portion = close_ratio * current_cost (negative of a portion)
-        // Proceeds from close = fill_quantity * fill_price
-        // Long 10 cost 500k, close 3 @ 48k: (-0.3 * 500k) - (-3 * 48k) = -150k + 144k = -6k ✓
-        let realized_pnl = (close_ratio * current_cost) - (fill_quantity * fill_price);
-        *collateral += realized_pnl;
-        let pos = positions.get_mut(market_id).unwrap();
-        pos.quantity = new_qty;
-        pos.cost_basis = current_cost * (Decimal::ONE + close_ratio);
-    } else {
-        // Flip: close entire old position, open new in opposite direction
-        // Same formula as full close for the PnL
-        let close_pnl = (fill_price * current_qty) - current_cost;
-        *collateral += close_pnl;
-        positions.insert(
-            market_id.clone(),
-            Position {
-                market_id: market_id.clone(),
-                quantity: new_qty,
-                cost_basis: new_qty * fill_price,
-            },
-        );
+        return;
     }
+
+    // Opposite direction: either partial close or flip
+    if new_qty.signum() == current_qty.signum() {
+        // Partial close: closes a fraction of the existing position (no flip).
+        //
+        // Use a sign-safe fraction-based realization:
+        //   closed_fraction = |fill| / |current|
+        //   closed_qty      = current_qty * closed_fraction   (same sign as current)
+        //   closed_cost     = current_cost * closed_fraction  (same sign as current_cost)
+        //   realized_pnl    = closed_qty*price - closed_cost
+        //
+        // This works for both longs and shorts without relying on negative ratios.
+        let closed_fraction = fill_quantity.abs() / current_qty.abs();
+
+        // Defensive: if precision causes slight overshoot, cap at 1.
+        let closed_fraction = if closed_fraction > Decimal::ONE {
+            Decimal::ONE
+        } else {
+            closed_fraction
+        };
+
+        let closed_qty = current_qty * closed_fraction;
+        let closed_cost = current_cost * closed_fraction;
+
+        let realized_pnl = (closed_qty * fill_price) - closed_cost;
+        *collateral += realized_pnl;
+
+        let pos = positions.get_mut(market_id).expect("position must exist");
+        pos.quantity = new_qty;
+        pos.cost_basis = current_cost - closed_cost;
+
+        // If we somehow ended up at (very close to) zero, remove the position.
+        // (Normally the earlier new_qty.is_zero() branch handles exact closure.)
+        if pos.quantity.is_zero() {
+            positions.remove(market_id);
+        }
+
+        return;
+    }
+
+    // Flip: close entire old position, open remainder in opposite direction
+    let close_pnl = (fill_price * current_qty) - current_cost;
+    *collateral += close_pnl;
+
+    positions.insert(
+        market_id.clone(),
+        Position {
+            market_id: market_id.clone(),
+            quantity: new_qty,
+            cost_basis: new_qty * fill_price,
+        },
+    );
 }

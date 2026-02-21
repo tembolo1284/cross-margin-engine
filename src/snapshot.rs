@@ -15,6 +15,8 @@ pub struct Snapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AccountSnapshot {
     pub collateral: Decimal,
+    pub bankruptcy_deficit: Decimal,
+
     pub equity: Decimal,
     pub unrealized_pnl: Decimal,
     pub initial_margin_required: Decimal,
@@ -43,18 +45,19 @@ pub fn capture(state: &State, after_sequence: u64) -> Snapshot {
 
         let mut positions = BTreeMap::new();
         for (market_id, pos) in &account.positions {
-            let mark = state.markets[market_id].mark_price;
+            let mark = state
+                .markets
+                .get(market_id)
+                .map(|m| m.mark_price)
+                .unwrap_or(Decimal::ZERO);
+
             positions.insert(
                 market_id.clone(),
                 PositionSnapshot {
                     quantity: pos.quantity,
                     cost_basis: pos.cost_basis,
                     mark_price: mark,
-                    unrealized_pnl: margin::position_unrealized_pnl(
-                        pos.quantity,
-                        pos.cost_basis,
-                        mark,
-                    ),
+                    unrealized_pnl: margin::position_unrealized_pnl(pos.quantity, pos.cost_basis, mark),
                     notional: margin::position_notional(pos.quantity, mark),
                 },
             );
@@ -64,6 +67,8 @@ pub fn capture(state: &State, after_sequence: u64) -> Snapshot {
             account_id.clone(),
             AccountSnapshot {
                 collateral: account.collateral,
+                bankruptcy_deficit: account.bankruptcy_deficit,
+
                 equity: eq,
                 unrealized_pnl: upnl,
                 initial_margin_required: im,

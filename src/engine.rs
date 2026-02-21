@@ -6,6 +6,7 @@ use crate::state::State;
 use crate::types::{AccountId, Market};
 
 use rust_decimal::Decimal;
+use std::collections::BTreeSet;
 
 /// Result of applying a single event.
 enum ApplyResult {
@@ -69,10 +70,7 @@ impl Engine {
                         reason,
                     },
                 },
-                EventType::Withdraw {
-                    account_id,
-                    amount,
-                } => Event {
+                EventType::Withdraw { account_id, amount } => Event {
                     sequence: self.next_sequence,
                     event_type: EventType::WithdrawalRejected {
                         account_id: account_id.clone(),
@@ -82,6 +80,7 @@ impl Engine {
                 },
                 _ => unreachable!("Only trades and withdrawals can be rejected"),
             };
+
             self.next_sequence += 1;
             self.event_log.push(reject_event.clone());
             self.snapshots
@@ -93,16 +92,21 @@ impl Engine {
         self.snapshots
             .push(snapshot::capture(&self.state, event.sequence));
 
-        // Determine which accounts need liquidation scanning based on event type
-        let accounts_to_scan: Vec<AccountId> = match &event.event_type {
-            EventType::TradeFill { account_id, .. } => vec![account_id.clone()],
-            EventType::MarkPriceUpdate { market_id, .. } => {
-                self.state.accounts_with_position_in(market_id)
-            }
-            EventType::FundingUpdate { market_id, .. } => {
-                self.state.accounts_with_position_in(market_id)
-            }
-            _ => vec![],
+        // Determine which accounts need liquidation scanning based on event type.
+        // Use a BTreeSet to canonicalize ordering and deduplicate deterministically.
+        let accounts_to_scan: BTreeSet<AccountId> = match &event.event_type {
+            EventType::TradeFill { account_id, .. } => [account_id.clone()].into_iter().collect(),
+            EventType::MarkPriceUpdate { market_id, .. } => self
+                .state
+                .accounts_with_position_in(market_id)
+                .into_iter()
+                .collect(),
+            EventType::FundingUpdate { market_id, .. } => self
+                .state
+                .accounts_with_position_in(market_id)
+                .into_iter()
+                .collect(),
+            _ => BTreeSet::new(),
         };
 
         // Execute liquidations and snapshot after each
@@ -130,17 +134,16 @@ impl Engine {
                 ApplyResult::Ok
             }
 
-            EventType::Withdraw {
-                account_id,
-                amount,
-            } => match risk::check_withdrawal(&self.state, account_id, *amount) {
-                TradeCheck::Accepted => {
-                    let account = self.state.accounts.get_mut(account_id).unwrap();
-                    account.collateral -= amount;
-                    ApplyResult::Ok
+            EventType::Withdraw { account_id, amount } => {
+                match risk::check_withdrawal(&self.state, account_id, *amount) {
+                    TradeCheck::Accepted => {
+                        let account = self.state.accounts.get_mut(account_id).unwrap();
+                        account.collateral -= amount;
+                        ApplyResult::Ok
+                    }
+                    TradeCheck::Rejected(reason) => ApplyResult::Rejected(reason),
                 }
-                TradeCheck::Rejected(reason) => ApplyResult::Rejected(reason),
-            },
+            }
 
             EventType::TradeFill {
                 account_id,
@@ -187,17 +190,22 @@ impl Engine {
                 let affected = self.state.accounts_with_position_in(market_id);
                 for account_id in &affected {
                     let account = self.state.accounts.get_mut(account_id).unwrap();
+
                     let last_index = account
                         .last_funding
                         .get(market_id)
                         .copied()
                         .unwrap_or(old_index);
-                    let quantity = account.positions[market_id].quantity;
-                    let funding_delta = (last_index - new_cumulative_index) * quantity;
-                    account.collateral += funding_delta;
-                    account
-                        .last_funding
-                        .insert(market_id.clone(), *new_cumulative_index);
+
+                    // Defensive: avoid panics if the affected list ever goes stale.
+                    if let Some(pos) = account.positions.get(market_id) {
+                        let quantity = pos.quantity;
+                        let funding_delta = (last_index - *new_cumulative_index) * quantity;
+                        account.collateral += funding_delta;
+                        account
+                            .last_funding
+                            .insert(market_id.clone(), *new_cumulative_index);
+                    }
                 }
 
                 ApplyResult::Ok
@@ -229,16 +237,37 @@ impl Engine {
     }
 
     /// Replay a full event log from scratch. Returns the final state and snapshots.
+    ///
+    /// Note: During replay, it is EXPECTED that some `TradeFill`/`Withdraw` events may be
+    /// rejected again if the log includes the original attempted action plus an informational
+    /// `TradeRejected`/`WithdrawalRejected` entry. In that case, state remains unchanged and we
+    /// record a warning instead of panicking.
     pub fn replay(event_log: &[Event], markets: Vec<Market>) -> (State, Vec<Snapshot>) {
         let mut engine = Engine::new();
         for market in markets {
             engine.add_market(market);
         }
 
+        // Optional: advance next_sequence so future appends (if ever added) are consistent.
+        if let Some(last) = event_log.last() {
+            engine.next_sequence = last.sequence.saturating_add(1);
+        }
+
         let mut snapshots = Vec::new();
 
         for event in event_log {
-            let _ = engine.apply_event(event);
+            match engine.apply_event(event) {
+                ApplyResult::Ok => {}
+                ApplyResult::Rejected(reason) => {
+                    // Expected for attempted actions that failed margin checks in live mode.
+                    // State is unchanged (apply_event returned Rejected without mutating).
+                    eprintln!(
+                        "[replay] event seq {} was rejected again (expected): {}",
+                        event.sequence, reason
+                    );
+                }
+            }
+
             snapshots.push(snapshot::capture(&engine.state, event.sequence));
         }
 
