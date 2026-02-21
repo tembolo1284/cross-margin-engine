@@ -6,7 +6,7 @@ This is a deterministic, event-sourced cross-margin risk engine for perpetual fu
 
 **Language choice: Rust.** The type system encodes invariants (e.g., signed quantities, exhaustive event matching). The `rust_decimal` crate provides exact decimal arithmetic without IEEE 754 nondeterminism. There is no garbage collector to introduce timing variability. These properties make determinism natural rather than something bolted on after the fact.
 
-**AI usage:** Claude (Anthropic) was used as a design collaborator throughout. All architectural decisions, formulas, and tradeoffs were discussed interactively before any code was written. Claude also assisted with Rust implementation. All output was reviewed, tested, and validated by the author.
+**AI usage:** Claude (Anthropic) was used as a design collaborator throughout. All architectural decisions, formulas, and tradeoffs were discussed interactively before any code was written. Claude assisted with Rust scenario generation and debugging only. All output was reviewed, tested, and validated by me the author!
 
 ---
 
@@ -22,7 +22,7 @@ Account {
 }
 ```
 
-`collateral` reflects all realized cash flows: deposits, withdrawals, realized PnL from closed trades, and settled funding. Unrealized PnL is never stored — it is always computed dynamically from mark prices.
+`collateral` reflects all realized cash flows: deposits, withdrawals, realized PnL from closed trades, and settled funding. Unrealized PnL is never stored — it is always computed dynamically from mark prices on the fly.
 
 ### Position
 ```
@@ -91,7 +91,7 @@ The signed convention handles all cases without branching:
 
 ### Portfolio Equity
 ```
-equity = collateral + Σ unrealized_pnl_i
+equity = collateral + the sum of unrealized_pnl_i  (over all indices i)
 ```
 
 Funding is settled eagerly into collateral when `FundingUpdate` events arrive, so there is no unsettled funding term in the equity formula at evaluation time.
@@ -109,16 +109,18 @@ Sign convention: when the index increases, longs pay and shorts receive. The sub
 
 **Design choice: eager settlement.** Funding is applied to collateral immediately when the event arrives. This isolates funding logic to one event handler and keeps the equity formula simple. The cost is iterating affected accounts on each funding event, which is acceptable for this scope.
 
+In a production system, funding settlement is typically lazy or batched (e.g., settled on account interaction or via background sweeps) to avoid iterating all accounts per funding tick; eager settlement is used here to keep the equity formula simple and replay behavior explicit.
+
 ### Margin Requirements
 ```
 position_notional_i        = abs(mark_price_i * quantity_i)
-initial_margin_required    = Σ (notional_i * initial_margin_fraction_i)
-maintenance_margin_required = Σ (notional_i * maintenance_margin_fraction_i)
+initial_margin_required    = sum over i (notional_i * initial_margin_fraction_i)
+maintenance_margin_required = sum over i (notional_i * maintenance_margin_fraction_i)
 ```
 
 This is an **additive cross-margin model**. Each position contributes independently to the total requirement, but all positions draw from the shared collateral pool. There are no offset credits for correlated or hedged positions.
 
-This is conservative (it overstates requirements relative to portfolio-margining with offsets) and is the standard base model used by most perpetual exchanges.
+This is conservative (it overstates requirements relative to portfolio-margining with offsets) and is the standard base model used by most perpetual exchanges as far as I could tell.
 
 ### Health Evaluation
 ```
@@ -145,7 +147,7 @@ When a `TradeFill { account_id, market_id, quantity, price }` arrives:
 new_quantity = old_quantity + fill_quantity
 ```
 
-Four cases for cost basis and realized PnL:
+We have four cases for cost basis and realized PnL:
 
 **Increasing (same direction):**
 ```
@@ -173,21 +175,21 @@ The realized PnL formula is consistent across all cases: it computes the value o
 **2. Compute simulated equity.**
 ```
 simulated_collateral  = old_collateral + realized_pnl
-simulated_unrealized  = Σ (mark_price_i * simulated_qty_i - simulated_cost_basis_i)
+simulated_unrealized  = sum over i (mark_price_i * simulated_qty_i - simulated_cost_basis_i)
 simulated_equity      = simulated_collateral + simulated_unrealized
 ```
 
 **3. Compute simulated initial margin.**
 ```
-simulated_im = Σ abs(mark_price_i * simulated_qty_i) * im_fraction_i
+simulated_im = sum over i abs(mark_price_i * simulated_qty_i) * im_fraction_i
 ```
 
 Note: the summation is across **all** positions in the account, not just the market being traded. This is the cross-margin check — a trade in one market may be rejected because the account's combined exposure across all markets exceeds what its equity can support.
 
 **4. Accept or reject.**
 ```
-if simulated_equity >= simulated_im → apply trade
-else → reject, state unchanged
+if simulated_equity >= simulated_im -> apply trade
+else -> reject, state unchanged
 ```
 
 ### Risk-Reducing Trades
@@ -237,7 +239,7 @@ For a liquidatable account:
    - Emit a `LiquidationFill` event to the log.
 3. Recheck equity vs. maintenance margin.
 4. If still liquidatable and positions remain, continue to next position.
-5. If all positions closed and collateral is negative, the account is bankrupt. The deficit is tracked.
+5. If all positions closed and collateral is negative, the account is bankrupt. If all positions are closed and collateral is negative, the account is bankrupt; the engine records this as a persistent bankruptcy_deficit = abs(min(collateral, 0)) (or an equivalent explicit field/log entry) so the deficit is auditable and replay-stable.
 
 ### Why These Simplifications
 
@@ -266,6 +268,8 @@ Even with exact decimal arithmetic, division can produce results that exceed rep
 - **Cost basis reduction on partial close:** Round toward zero on the realized portion.
 - **All rounding is applied at state mutation boundaries**, not during intermediate computation.
 
+State mutation boundaries in this engine are the moments we commit values into persisted state: updating Account.collateral, updating Position.quantity / Position.cost_basis, updating Account.last_funding[market], and writing aggregated margin requirement totals used for allow/reject decisions. Intermediate arithmetic inside a single apply_event() evaluation is left unrounded to avoid order-dependent drift.
+
 In practice, with `rust_decimal`'s 28-digit precision, rounding is rarely triggered in this demo's value ranges. The policy exists as a documented safeguard.
 
 ### Structural Guarantees
@@ -280,7 +284,7 @@ In practice, with `rust_decimal`'s 28-digit precision, rounding is rarely trigge
 
 The engine has a single event processing function used in both live and replay modes:
 ```
-apply_event(state, event) → state'
+apply_event(state, event) -> state'
 ```
 
 This function performs pure state mutation: deposits, withdrawals, trade application, price updates, funding settlement, and liquidation fill application. It contains no liquidation scanning or event generation logic.
@@ -311,15 +315,15 @@ An account deposits collateral, opens a leveraged long position, and is liquidat
 1. Alice deposits 100,000
 2. BTC-PERP mark price set to 50,000 (5% IM, 3% MM)
 3. Alice longs 10 BTC-PERP at 50,000
-   → Notional: 500,000 | IM: 25,000 | Equity: 100,000 ✓
+   -> Notional: 500,000 | IM: 25,000 | Equity: 100,000
 4. BTC-PERP mark drops to 42,000
-   → Unrealized PnL: -80,000 | Equity: 20,000
-   → MM required: 12,600 | 20,000 > 12,600 → still healthy
+   -> Unrealized PnL: -80,000 | Equity: 20,000
+   -> MM required: 12,600 | 20,000 > 12,600 -> still healthy
 5. BTC-PERP mark drops to 41,000
-   → Unrealized PnL: -90,000 | Equity: 10,000
-   → MM required: 12,300 | 10,000 < 12,300 → LIQUIDATABLE
+   -> Unrealized PnL: -90,000 | Equity: 10,000
+   -> MM required: 12,300 | 10,000 < 12,300 -> LIQUIDATABLE
 6. Engine closes position at mark, emits LiquidationFill
-   → Realized PnL: -90,000 | Collateral: 10,000 | No positions
+   -> Realized PnL: -90,000 | Collateral: 10,000 | No positions
 ```
 
 ### Scenario 2: Trade Rejected on Margin
@@ -329,10 +333,10 @@ An account attempts to open a position that would exceed initial margin.
 1. Bob deposits 10,000
 2. ETH-PERP mark price set to 3,000 (10% IM, 5% MM)
 3. Bob longs 20 ETH-PERP at 3,000
-   → Notional: 60,000 | IM: 6,000 | Equity: 10,000 ✓
+   -> Notional: 60,000 | IM: 6,000 | Equity: 10,000
 4. Bob attempts to long 20 more ETH-PERP at 3,000
-   → Simulated notional: 120,000 | Simulated IM: 12,000
-   → Equity: 10,000 < 12,000 → REJECTED
+   -> Simulated notional: 120,000 | Simulated IM: 12,000
+   -> Equity: 10,000 < 12,000 → REJECTED
 ```
 
 ### Scenario 3: Cross-Margin Portfolio Constraint
@@ -341,15 +345,15 @@ This scenario demonstrates the core cross-margin behavior: margin is evaluated a
 ```
 1. Charlie deposits 20,000
 2. Charlie longs 5 BTC-PERP at 50,000
-   → Notional: 250,000 | IM: 12,500 | Equity: 20,000 ✓
+   -> Notional: 250,000 | IM: 12,500 | Equity: 20,000
 3. Charlie attempts to long 30 ETH-PERP at 3,000
-   → ETH notional: 90,000 | ETH IM alone: 9,000 (would pass in isolation)
-   → Combined IM: 12,500 + 9,000 = 21,500
-   → Equity: 20,000 < 21,500 → REJECTED
+   -> ETH notional: 90,000 | ETH IM alone: 9,000 (would pass in isolation)
+   -> Combined IM: 12,500 + 9,000 = 21,500
+   -> Equity: 20,000 < 21,500 -> REJECTED
 4. Charlie longs 15 ETH-PERP at 3,000
-   → ETH notional: 45,000 | ETH IM: 4,500
-   → Combined IM: 12,500 + 4,500 = 17,000
-   → Equity: 20,000 ≥ 17,000 → ACCEPTED
+   -> ETH notional: 45,000 | ETH IM: 4,500
+   -> Combined IM: 12,500 + 4,500 = 17,000
+   -> Equity: 20,000 ≥ 17,000 -> ACCEPTED
 ```
 
 ### Scenario 4: Funding Payment
@@ -358,8 +362,8 @@ Demonstrates eager funding settlement. Bob holds a long ETH position when the cu
 ```
 1. Bob holds 20 ETH-PERP (long), collateral: 10,000
 2. Funding index increases from 0 to 1.50
-   → funding_delta = (0 - 1.50) × 20 = -30
-   → Collateral: 10,000 → 9,970 (Bob pays 30 as a long)
+   -> funding_delta = (0 - 1.50) × 20 = -30
+   -> Collateral: 10,000 → 9,970 (Bob pays 30 as a long)
 ```
 
 ### Scenario 5: Replay Determinism
